@@ -1,0 +1,116 @@
+package main
+
+import (
+"fmt"
+"log"
+"net/http"
+"os"
+"sync"
+
+"github.com/gorilla/websocket"
+)
+
+var upgrader = websocket.Upgrader{
+CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+type Peer struct {
+ID string
+Conn *websocket.Conn
+Mu sync.Mutex
+}
+
+var (
+peersPool = make(map[string]*Peer)
+poolMu sync.Mutex
+)
+
+func main() {
+port := os.Getenv("PORT")
+if port == "" {
+port = "8080"
+}
+
+http.HandleFunc("/connect-peer", handlePeerConnection)
+http.HandleFunc("/proxy", handleProxyBuyerRequest)
+
+fmt.Printf("🚀 DataMarket Core Gateway active on port %s...\n", port)
+log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func handlePeerConnection(w http.ResponseWriter, r *http.Request) {
+peerID := r.URL.Query().Get("user_id")
+if peerID == "" {
+http.Error(w, "Missing user_id", http.StatusBadRequest)
+return
+}
+
+ws, err := upgrader.Upgrade(w, r, nil)
+if err != nil {
+log.Println("Upgrade error:", err)
+return
+}
+
+peer := &Peer{ID: peerID, Conn: ws}
+poolMu.Lock()
+peersPool[peerID] = peer
+poolMu.Unlock()
+
+log.Printf("📱 Node Online: %s", peerID)
+
+defer func() {
+poolMu.Lock()
+delete(peersPool, peerID)
+poolMu.Unlock()
+ws.Close()
+log.Printf("❌ Node Offline: %s", peerID)
+}()
+
+for {
+_, _, err := ws.ReadMessage()
+if err != nil {
+break
+}
+}
+}
+
+func handleProxyBuyerRequest(w http.ResponseWriter, r *http.Request) {
+targetURL := r.Header.Get("X-Target-URL")
+if targetURL == "" {
+http.Error(w, "Missing X-Target-URL header", http.StatusBadRequest)
+return
+}
+
+poolMu.Lock()
+var selectedPeer *Peer
+for _, p := range peersPool {
+selectedPeer = p
+break
+}
+poolMu.Unlock()
+
+if selectedPeer == nil {
+http.Error(w, "No active mobile proxy nodes available", http.StatusServiceUnavailable)
+return
+}
+
+selectedPeer.Mu.Lock()
+err := selectedPeer.Conn.WriteMessage(websocket.TextMessage, []byte(targetURL))
+if err != nil {
+selectedPeer.Mu.Unlock()
+http.Error(w, "Failed to send request to node", http.StatusInternalServerError)
+return
+}
+
+_, responseBytes, err := selectedPeer.Conn.ReadMessage()
+selectedPeer.Mu.Unlock()
+
+if err != nil {
+http.Error(w, "Timeout fetching from node", http.StatusGatewayTimeout)
+return
+}
+
+w.WriteHeader(http.StatusOK)
+w.Write(responseBytes)
+log.Printf("METER: Relayed %d bytes via Node %s", len(responseBytes), selectedPeer.ID)
+}
